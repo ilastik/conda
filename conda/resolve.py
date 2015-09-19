@@ -8,7 +8,7 @@ from functools import partial
 
 from conda import verlib
 from conda.utils import memoize
-from conda.compat import itervalues, iteritems
+from conda.compat import itervalues, iteritems, zip_longest, string_types
 from conda.logic import (false, true, sat, min_sat, generate_constraints,
     bisect_constraints, evaluate_eq, minimal_unsatisfiable_subset, MaximumIterationsError)
 from conda.console import setup_handlers
@@ -31,6 +31,144 @@ def normalized_version(version):
         if suggested_version:
             return verlib.NormalizedVersion(suggested_version)
         return version
+
+class SimpleVersionOrder(object):
+    '''
+    This class implements a simple order relation between versions. 
+    Version strings are parsed as follows:
+    * they are first split into epoch and version number at '!'
+      (if there is no '!', the epoch is set to 0)
+    * the version part is then split into components at '.'
+    * each component is split again into runs of numerals and non-numerals
+    * subcomponents containing only numerals are converted to integers
+    * strings are converted to lower case
+    * '-', '+', '_' are treated as letters, not separators
+    Examples:
+    
+        1.2g.beta15.rc  =>  [[0], [1], [2, 'g'], ['beta', 15], ['rc']]
+        1!2.15.1_ALPHA  =>  [[1], [2], [15], [1, '_alpha']]
+         
+    The resulting lists are compared lexicographically, where the following
+    rules apply for each pair of corresponding subcomponents:
+    * integers are compared numerically
+    * strings are compared lexicographically, case-insensitive
+    * strings are smaller than integers
+    * if a subcomponent has no correspondent, the missing correspondent is      
+      treated as integer 0.
+    The resulting order is:
+    
+           0.4
+        == 0.4.0     # due to 0-padding
+         < 0.4.1.rc
+        == 0.4.1.RC  # case-insensitive comparison
+         < 0.4.1
+         < 0.5a1
+         < 0.5b3
+         < 0.5C1     # case-insensitive comparison
+         < 0.5
+         < 0.9.6
+         < 0.960923
+         < 1.0
+         < 1.0.4a3
+         < 1.0.4b1
+         < 1.0.4
+         < 1996.07.12
+         < 1!0.4.1   # epoch increased
+         < 1!3.1.1.6
+         < 2!0.4.1
+         
+    Some packages (most notably openssl) have incompatible version conventions. 
+    In particular, openssl interprets letters as version counters rather than
+    pre-release identifier. For openssl, the relation
+    
+      1.0.1 < 1.0.1a   =>   True   # for openssl
+      
+    holds, whereas conforming packages use the opposite ordering (interpreting 'a' 
+    as 'alpha'). You can work-around this problem by appending a dash to 
+    plain version numbers:
+    
+      1.0.1  =>  1.0.1_    # ensure correct ordering for openssl
+    '''
+    def __init__(self, version):
+        error = ValueError("Malformed version string '%s'." % version)
+        # version comparison is case-insensitive
+        version = version.strip().rstrip().lower()
+        # find epoch and version components
+        version = version.split('!')
+        if len(version) == 1:
+            # epoch not given => set it to '0'
+            version = ['0'] + version[0].split('.')
+        elif len(version) == 2:
+            # epoch given, must be an integer
+            if not version[0].isdigit():
+                raise error
+            version = [version[0]] + version[1].split('.')
+        else:
+            raise error
+        # split components into runs of numerals and non-numerals and
+        # convert numerals to int, convert 'post' to infinity
+        first_string = True
+        for k in range(len(version)):
+            c = re.findall('([0-9]+|[^0-9]+)', version[k])
+            if not c:
+                raise error
+            for j in range(len(c)):
+                if c[j].isdigit():
+                    c[j] = int(c[j])
+                else:
+                    # some strings have special meaning when they are the
+                    # first non-numeric version component
+                    if first_string:
+                        if c[j]=='post':
+                            c[j] = 2**30 
+                        elif c[j]=='dev':
+                            c[j] = '____________dev'
+                    first_string = False
+            version[k] = c
+        self.version = version
+        # strings are less than numbers
+        self.string_vs_int = True
+    
+    def __eq__(self, other):
+        # note: explicit padding is necessary to ensure '1.4' == '1.4.0'
+        for v1, v2 in zip_longest(self.version, other.version, fillvalue=[0]):
+            for c1, c2 in zip_longest(v1, v2, fillvalue=0):
+                if c1 != c2:
+                    return False
+        return True
+        
+    def __ne__(self, other):
+        return not (self == other)
+    
+    def __lt__(self, other):
+        # note: explicit padding is necessary to ensure '1.4' == '1.4.0'
+        for v1, v2 in zip_longest(self.version, other.version, fillvalue=[0]):
+            for c1, c2 in zip_longest(v1, v2, fillvalue=0):
+                if isinstance(c1, string_types):
+                    if not isinstance(c2, string_types):
+                        # str vs int
+                        return self.string_vs_int
+                else:
+                    if isinstance(c2, string_types):
+                        # int vs str
+                        return not self.string_vs_int
+                # c1 and c2 have the same type
+                if c1 < c2:
+                    return True
+                if c2 < c1:
+                    return False
+                # c1 == c2 => advance
+        # v1 == v2
+        return False
+
+    def __gt__(self, other):
+        return other < self
+
+    def __le__(self, other):
+        return not (other < self)
+
+    def __ge__(self, other):
+        return not (self < other)
 
 
 class NoPackagesFound(RuntimeError):
@@ -161,6 +299,78 @@ class MatchSpec(object):
     def __str__(self):
         return self.spec
 
+
+class PackageNew(object):
+    """
+    The only purpose of this class is to provide package objects which
+    are sortable.
+    """
+    def __init__(self, fn, info):
+        self.fn = fn
+        self.name = info['name']
+        self.version = info['version']
+        self.build_number = info['build_number']
+        self.build = info['build']
+        self.channel = info.get('channel')
+        self.norm_version = normalized_version(self.version)
+        self.list_version = SimpleVersionOrder(self.version)
+        self.info = info
+
+    def _asdict(self):
+        result = self.info.copy()
+        result['fn'] = self.fn
+        result['norm_version'] = str(self.norm_version)
+        return result
+
+    # http://python3porting.com/problems.html#unorderable-types-cmp-and-cmp
+#     def __cmp__(self, other):
+#         if self.name != other.name:
+#             raise ValueError('cannot compare packages with different '
+#                              'names: %r %r' % (self.fn, other.fn))
+#         try:
+#             return cmp((self.norm_version, self.build_number),
+#                       (other.norm_version, other.build_number))
+#         except TypeError:
+#             return cmp((self.version, self.build_number),
+#                       (other.version, other.build_number))
+
+    def __lt__(self, other):
+        if self.name != other.name:
+            raise TypeError('cannot compare packages with different '
+                             'names: %r %r' % (self.fn, other.fn))
+        if isinstance(self.norm_version, verlib.NormalizedVersion) and \
+           isinstance(other.norm_version, verlib.NormalizedVersion):
+            # FIXME: 'self.build' and 'other.build' are intentionally swapped
+            # FIXME: see https://github.com/conda/conda/commit/3cc3ecc662914abe1d98b8d9c4caaa7c932a838e
+            # FIXME: This should be reverted when the underlying problem is solved.
+            return ((self.list_version, self.build_number, other.build) <
+                    (other.list_version, other.build_number, self.build))
+        else:
+            return ((self.list_version, self.build_number) <
+                    (other.list_version, other.build_number))
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __eq__(self, other):
+        if not isinstance(other, Package):
+            return False
+        if self.name != other.name:
+            return False
+        return ((self.norm_version, self.build_number, self.build) ==
+                (other.norm_version, other.build_number, other.build))
+
+    def __gt__(self, other):
+        return other < self
+
+    def __le__(self, other):
+        return not (other < self)
+
+    def __ge__(self, other):
+        return not (self < other)
+
+    def __repr__(self):
+        return '<Package %s>' % self.fn
 
 class Package(object):
     """
