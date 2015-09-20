@@ -32,6 +32,8 @@ def normalized_version(version):
             return verlib.NormalizedVersion(suggested_version)
         return version
 
+version_check_re = re.compile(r'[\*\.!_0-9A-Za-z]+')
+version_split_re = re.compile('([0-9]+|[^0-9]+)')
 class SimpleVersionOrder(object):
     '''
     This class implements a simple order relation between versions. 
@@ -91,6 +93,8 @@ class SimpleVersionOrder(object):
     '''
     def __init__(self, version):
         error = ValueError("Malformed version string '%s'." % version)
+        if not version_check_re.match(version):
+            raise error
         # version comparison is case-insensitive
         version = version.strip().rstrip().lower()
         # find epoch and version components
@@ -105,29 +109,23 @@ class SimpleVersionOrder(object):
             version = [version[0]] + version[1].split('.')
         else:
             raise error
-        # split components into runs of numerals and non-numerals and
-        # convert numerals to int, convert 'post' to infinity
-        first_string = True
+        # split components into runs of numerals and non-numerals,
+        # convert numerals to int, handle special strings
         for k in range(len(version)):
-            c = re.findall('([0-9]+|[^0-9]+)', version[k])
+            c = version_split_re.findall(version[k])
             if not c:
                 raise error
             for j in range(len(c)):
                 if c[j].isdigit():
                     c[j] = int(c[j])
-                else:
-                    # some strings have special meaning when they are the
-                    # first non-numeric version component
-                    if first_string:
-                        if c[j]=='post':
-                            c[j] = 2**30 
-                        elif c[j]=='dev':
-                            c[j] = '____________dev'
-                    first_string = False
+                elif c[j]=='post':
+                    # ensure number < 'post'
+                    c[j] = float('inf')
+                elif c[j]=='dev':
+                    # use upper-case since '*' < 'DEV' < '_' < 'a' < number
+                    c[j] = 'DEV'
             version[k] = c
         self.version = version
-        # strings are less than numbers
-        self.string_vs_int = True
     
     def __eq__(self, other):
         # note: explicit padding is necessary to ensure '1.4' == '1.4.0'
@@ -146,12 +144,12 @@ class SimpleVersionOrder(object):
             for c1, c2 in zip_longest(v1, v2, fillvalue=0):
                 if isinstance(c1, string_types):
                     if not isinstance(c2, string_types):
-                        # str vs int
-                        return self.string_vs_int
+                        # str < int
+                        return True
                 else:
                     if isinstance(c2, string_types):
-                        # int vs str
-                        return not self.string_vs_int
+                        # not (int < str)
+                        return False
                 # c1 and c2 have the same type
                 if c1 < c2:
                     return True
@@ -176,7 +174,11 @@ class NoPackagesFound(RuntimeError):
         super(NoPackagesFound, self).__init__(msg)
         self.pkgs = pkgs
 
-const_pat = re.compile(r'([=<>!]{1,2})(\S+)$')
+# This RE matches the operators '==', '!=', '<=', '>=', '<', '>'
+# followed by a version string. It rejects expressions like
+# '<= 1.2' (space after operator), '<>1.2' (unknown operator),
+# and '<=!1.2' (nonsensical operator).
+version_relation_re = re.compile(r'(==|!=|<=|>=|<|>)(?![=<>!])(\S+)$')
 def ver_eval(version, constraint):
     """
     return the Boolean result of a comparison between two versions, where the
@@ -184,47 +186,14 @@ def ver_eval(version, constraint):
     ver_eval('1.2', '>=1.1') will return True.
     """
     a = version
-    m = const_pat.match(constraint)
+    m = version_relation_re.match(constraint)
     if m is None:
         raise RuntimeError("Did not recognize version specification: %r" %
                            constraint)
     op, b = m.groups()
-    na = normalized_version(a)
-    nb = normalized_version(b)
-    if op == '==':
-        try:
-            return na == nb
-        except TypeError:
-            return a == b
-    elif op == '>=':
-        try:
-            return na >= nb
-        except TypeError:
-            return a >= b
-    elif op == '<=':
-        try:
-            return na <= nb
-        except TypeError:
-            return a <= b
-    elif op == '>':
-        try:
-            return na > nb
-        except TypeError:
-            return a > b
-    elif op == '<':
-        try:
-            return na < nb
-        except TypeError:
-            return a < b
-    elif op == '!=':
-        try:
-            return na != nb
-        except TypeError:
-            return a != b
-    else:
-        raise RuntimeError("Did not recognize version comparison operator: %r" %
-                           constraint)
-
+    na  = SimpleVersionOrder(a) 
+    nb  = SimpleVersionOrder(b) 
+    return eval('na' + op + 'nb')
 
 class VersionSpecAtom(object):
 
@@ -299,8 +268,18 @@ class MatchSpec(object):
     def __str__(self):
         return self.spec
 
+'''
+Comparison findings:
+--------------------
 
-class PackageNew(object):
+Order returned by 'conda search'
+* conforming versions: post is biggest, build string descending
+* non-conforming: post is string, build string ascending
+Order returned by original Package:
+* conforming:
+* non-conforming: post is string, build string ignored
+'''
+class Package(object):
     """
     The only purpose of this class is to provide package objects which
     are sortable.
@@ -312,14 +291,13 @@ class PackageNew(object):
         self.build_number = info['build_number']
         self.build = info['build']
         self.channel = info.get('channel')
-        self.norm_version = normalized_version(self.version)
-        self.list_version = SimpleVersionOrder(self.version)
+        self.norm_version = SimpleVersionOrder(self.version)
         self.info = info
 
     def _asdict(self):
         result = self.info.copy()
         result['fn'] = self.fn
-        result['norm_version'] = str(self.norm_version)
+        result['norm_version'] = self.version.lower()
         return result
 
     # http://python3porting.com/problems.html#unorderable-types-cmp-and-cmp
@@ -338,16 +316,8 @@ class PackageNew(object):
         if self.name != other.name:
             raise TypeError('cannot compare packages with different '
                              'names: %r %r' % (self.fn, other.fn))
-        if isinstance(self.norm_version, verlib.NormalizedVersion) and \
-           isinstance(other.norm_version, verlib.NormalizedVersion):
-            # FIXME: 'self.build' and 'other.build' are intentionally swapped
-            # FIXME: see https://github.com/conda/conda/commit/3cc3ecc662914abe1d98b8d9c4caaa7c932a838e
-            # FIXME: This should be reverted when the underlying problem is solved.
-            return ((self.list_version, self.build_number, other.build) <
-                    (other.list_version, other.build_number, self.build))
-        else:
-            return ((self.list_version, self.build_number) <
-                    (other.list_version, other.build_number))
+        return ((self.norm_version, self.build_number, self.build) <
+                (other.norm_version, other.build_number, other.build))
 
     def __ne__(self, other):
         return not self == other
@@ -371,75 +341,6 @@ class PackageNew(object):
 
     def __repr__(self):
         return '<Package %s>' % self.fn
-
-class Package(object):
-    """
-    The only purpose of this class is to provide package objects which
-    are sortable.
-    """
-    def __init__(self, fn, info):
-        self.fn = fn
-        self.name = info['name']
-        self.version = info['version']
-        self.build_number = info['build_number']
-        self.build = info['build']
-        self.channel = info.get('channel')
-        self.norm_version = normalized_version(self.version)
-        self.info = info
-
-    def _asdict(self):
-        result = self.info.copy()
-        result['fn'] = self.fn
-        result['norm_version'] = str(self.norm_version)
-        return result
-
-    # http://python3porting.com/problems.html#unorderable-types-cmp-and-cmp
-#     def __cmp__(self, other):
-#         if self.name != other.name:
-#             raise ValueError('cannot compare packages with different '
-#                              'names: %r %r' % (self.fn, other.fn))
-#         try:
-#             return cmp((self.norm_version, self.build_number),
-#                       (other.norm_version, other.build_number))
-#         except TypeError:
-#             return cmp((self.version, self.build_number),
-#                       (other.version, other.build_number))
-
-    def __lt__(self, other):
-        if self.name != other.name:
-            raise TypeError('cannot compare packages with different '
-                             'names: %r %r' % (self.fn, other.fn))
-        try:
-            return ((self.norm_version, self.build_number, other.build) <
-                    (other.norm_version, other.build_number, self.build))
-        except TypeError:
-            return ((self.version, self.build_number) <
-                    (other.version, other.build_number))
-
-    def __eq__(self, other):
-        if not isinstance(other, Package):
-            return False
-        if self.name != other.name:
-            return False
-        try:
-            return ((self.norm_version, self.build_number, self.build) ==
-                    (other.norm_version, other.build_number, other.build))
-        except TypeError:
-            return ((self.version, self.build_number, self.build) ==
-                    (other.version, other.build_number, other.build))
-
-    def __gt__(self, other):
-        return not (self.__lt__(other) or self.__eq__(other))
-
-    def __le__(self, other):
-        return self < other or self == other
-
-    def __ge__(self, other):
-        return self > other or self == other
-
-    def __repr__(self):
-        return '<Package %s>' % self.fn
-
 
 class Resolve(object):
 
