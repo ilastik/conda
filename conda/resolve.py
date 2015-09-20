@@ -6,7 +6,6 @@ import logging
 from collections import defaultdict
 from functools import partial
 
-from conda import verlib
 from conda.utils import memoize
 from conda.compat import itervalues, iteritems, zip_longest, string_types
 from conda.logic import (false, true, sat, min_sat, generate_constraints,
@@ -21,61 +20,86 @@ stdoutlog = logging.getLogger('stdoutlog')
 stderrlog = logging.getLogger('stderrlog')
 setup_handlers()
 
-
-def normalized_version(version):
-    version = version.replace('rc', '.dev99999')
-    try:
-        return verlib.NormalizedVersion(version)
-    except verlib.IrrationalVersionError:
-        suggested_version = verlib.suggest_normalized_version(version)
-        if suggested_version:
-            return verlib.NormalizedVersion(suggested_version)
-        return version
-
 version_check_re = re.compile(r'[\*\.!_0-9A-Za-z]+')
 version_split_re = re.compile('([0-9]+|[^0-9]+)')
-class SimpleVersionOrder(object):
+class VersionOrder(object):
     '''
-    This class implements a simple order relation between versions. 
+    This class implements an order relation between version strings. 
+    Version strings can contain the usual alphanumeric characters
+    (A-Za-z0-9_), separated into components by dots. Empty 
+    segments (i.e. two consecutive dots, a leading/trailing dot)
+    are not permitted. An optional epoch number - an integer 
+    followed by '!' - can preceed the actual version string 
+    (this is useful to indicate a change in the versioning
+    scheme). Version comparison is case-insensitive. 
+    
+    conda supports five types of version strings:
+    
+    * Release versions contain only integers, e.g. '1.0', '2.3.5'.
+    * Pre-release versions use additional letters such as 'a' or 'rc', 
+      for example '1.0a1', '1.2.beta3', '2.3.5rc3'.
+    * Development versions are indicated by the string 'dev', 
+      for example '1.0dev42', '2.3.5.dev12'.
+    * Post-release versions are indicated by the string 'post',
+      for example '1.0post1', '2.3.5.post2'.
+    * Tagged versions have a suffix that indicates a particular 
+      property of interest, e.g. '1.1.parallel'. Tags can be added 
+      to any of the other four types. As far as sorting is concerned.
+      tags are treated like the strings in pre-release versions.
+    
     Version strings are parsed as follows:
     * they are first split into epoch and version number at '!'
       (if there is no '!', the epoch is set to 0)
     * the version part is then split into components at '.'
     * each component is split again into runs of numerals and non-numerals
     * subcomponents containing only numerals are converted to integers
-    * strings are converted to lower case
-    * '-', '+', '_' are treated as letters, not separators
+    * strings are converted to lower case, with special treatment for 'dev' 
+      and 'post'
+    * the fillvalue -1 is inserted at the beginning of each component 
+      that starts with a letter to ensure '1.1.post1' < '1.1.1'
     Examples:
     
-        1.2g.beta15.rc  =>  [[0], [1], [2, 'g'], ['beta', 15], ['rc']]
+        1.2g.beta15.rc  =>  [[0], [1], [2, 'g'], [-1, 'beta', 15], [-1, 'rc']]
         1!2.15.1_ALPHA  =>  [[1], [2], [15], [1, '_alpha']]
          
     The resulting lists are compared lexicographically, where the following
     rules apply for each pair of corresponding subcomponents:
     * integers are compared numerically
     * strings are compared lexicographically, case-insensitive
-    * strings are smaller than integers
+    * general strings are smaller than integers
+    * 'dev' versions are smaller than all corresponding versions of other types
+    * 'post' versions are greater than all corresponding versions of other types
     * if a subcomponent has no correspondent, the missing correspondent is      
-      treated as integer 0.
+      treated as integer -1 to ensure '1.1' < '1.1.0' (this is necessary
+      for different package filenames to get different version numbers
+      in all cases).
     The resulting order is:
     
            0.4
-        == 0.4.0     # due to 0-padding
+         < 0.4.0
          < 0.4.1.rc
-        == 0.4.1.RC  # case-insensitive comparison
+        == 0.4.1.RC   # case-insensitive comparison
          < 0.4.1
          < 0.5a1
          < 0.5b3
-         < 0.5C1     # case-insensitive comparison
+         < 0.5C1      # case-insensitive comparison
          < 0.5
          < 0.9.6
          < 0.960923
          < 1.0
-         < 1.0.4a3
-         < 1.0.4b1
-         < 1.0.4
+         < 1.1dev1    # special case 'dev'
+         < 1.1a1      
+         < 1.1.dev1   # special case 'dev'
+         < 1.1.a1     
+         < 1.1        
+         < 1.1.post1  # special case 'post' 
+         < 1.1.0dev1  # special case 'dev' 
+         < 1.1.0rc1   
+         < 1.1.0      
+         < 1.1.0post1 # special case 'post' 
+         < 1.1post1   # special case 'post' 
          < 1996.07.12
-         < 1!0.4.1   # epoch increased
+         < 1!0.4.1    # epoch increased
          < 1!3.1.1.6
          < 2!0.4.1
          
@@ -92,9 +116,11 @@ class SimpleVersionOrder(object):
       1.0.1  =>  1.0.1_    # ensure correct ordering for openssl
     '''
     def __init__(self, version):
-        error = ValueError("Malformed version string '%s'." % version)
+        message = "Malformed version string '%s': " % version
+        if version == '':
+            raise ValueError("Empty version string.")
         if not version_check_re.match(version):
-            raise error
+            raise ValueError(message + "invalid character(s).")
         # version comparison is case-insensitive
         version = version.strip().rstrip().lower()
         # find epoch and version components
@@ -105,32 +131,37 @@ class SimpleVersionOrder(object):
         elif len(version) == 2:
             # epoch given, must be an integer
             if not version[0].isdigit():
-                raise error
+                raise ValueError(message + "epoch must be an integer.")
             version = [version[0]] + version[1].split('.')
         else:
-            raise error
+            raise ValueError(message + "duplicated epoch separator '!'.")
         # split components into runs of numerals and non-numerals,
         # convert numerals to int, handle special strings
+        self.version = []
         for k in range(len(version)):
             c = version_split_re.findall(version[k])
             if not c:
-                raise error
+                raise ValueError(message + "empty version component.")
             for j in range(len(c)):
                 if c[j].isdigit():
                     c[j] = int(c[j])
-                elif c[j]=='post':
-                    # ensure number < 'post'
+                elif c[j] == 'post':
+                    # ensure number < 'post' == infinity
                     c[j] = float('inf')
-                elif c[j]=='dev':
-                    # use upper-case since '*' < 'DEV' < '_' < 'a' < number
+                elif c[j] == 'dev':
+                    # ensure '*' < 'DEV' < '_' < 'a' < number
+                    # by upper-casing (all other strings are lower case)
                     c[j] = 'DEV'
-            version[k] = c
-        self.version = version
+            if not version[k][0].isdigit():
+                # components shall start with a number => insert fillvalue
+                self.version.append([-1] + c)
+            else:
+                self.version.append(c)
     
     def __eq__(self, other):
-        # note: explicit padding is necessary to ensure '1.4' == '1.4.0'
-        for v1, v2 in zip_longest(self.version, other.version, fillvalue=[0]):
-            for c1, c2 in zip_longest(v1, v2, fillvalue=0):
+        # 'fillvalue = -1' ensures '1.4' < '1.4.0'
+        for v1, v2 in zip_longest(self.version, other.version, fillvalue=[-1]):
+            for c1, c2 in zip_longest(v1, v2, fillvalue=-1):
                 if c1 != c2:
                     return False
         return True
@@ -139,9 +170,9 @@ class SimpleVersionOrder(object):
         return not (self == other)
     
     def __lt__(self, other):
-        # note: explicit padding is necessary to ensure '1.4' == '1.4.0'
-        for v1, v2 in zip_longest(self.version, other.version, fillvalue=[0]):
-            for c1, c2 in zip_longest(v1, v2, fillvalue=0):
+        # 'fillvalue = -1' ensures '1.4' < '1.4.0'
+        for v1, v2 in zip_longest(self.version, other.version, fillvalue=[-1]):
+            for c1, c2 in zip_longest(v1, v2, fillvalue=-1):
                 if isinstance(c1, string_types):
                     if not isinstance(c2, string_types):
                         # str < int
@@ -191,8 +222,8 @@ def ver_eval(version, constraint):
         raise RuntimeError("Did not recognize version specification: %r" %
                            constraint)
     op, b = m.groups()
-    na  = SimpleVersionOrder(a) 
-    nb  = SimpleVersionOrder(b) 
+    na  = VersionOrder(a) 
+    nb  = VersionOrder(b) 
     return eval('na' + op + 'nb')
 
 class VersionSpecAtom(object):
@@ -268,17 +299,6 @@ class MatchSpec(object):
     def __str__(self):
         return self.spec
 
-'''
-Comparison findings:
---------------------
-
-Order returned by 'conda search'
-* conforming versions: post is biggest, build string descending
-* non-conforming: post is string, build string ascending
-Order returned by original Package:
-* conforming:
-* non-conforming: post is string, build string ignored
-'''
 class Package(object):
     """
     The only purpose of this class is to provide package objects which
@@ -291,7 +311,7 @@ class Package(object):
         self.build_number = info['build_number']
         self.build = info['build']
         self.channel = info.get('channel')
-        self.norm_version = SimpleVersionOrder(self.version)
+        self.norm_version = VersionOrder(self.version)
         self.info = info
 
     def _asdict(self):
@@ -316,8 +336,11 @@ class Package(object):
         if self.name != other.name:
             raise TypeError('cannot compare packages with different '
                              'names: %r %r' % (self.fn, other.fn))
-        return ((self.norm_version, self.build_number, self.build) <
-                (other.norm_version, other.build_number, other.build))
+        # FIXME: 'self.build' and 'other.build' are intentionally swapped
+        # FIXME: see https://github.com/conda/conda/commit/3cc3ecc662914abe1d98b8d9c4caaa7c932a838e
+        # FIXME: This should be reverted when the underlying problem is solved.
+        return ((self.norm_version, self.build_number, other.build) <
+                (other.norm_version, other.build_number, self.build))
 
     def __ne__(self, other):
         return not self == other
